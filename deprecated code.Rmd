@@ -1,0 +1,72 @@
+---
+title: "deprecated functions"
+output: html_document
+date: "2025-09-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The below were deprecated in favor of a one-roll fread instead of manual separation.
+```{r Institution Information, message=FALSE, warning=FALSE}
+# Only 2010 and beyond contain longitude and latitude. Combining with prior years does fill these columns with NA.
+inst_new = ipeds_load_series(str_c("hd", 2010:2023), data_dir = "ipeds")  %>%
+    inst_info()
+inst2006_9 = ipeds_load_series(str_c("hd", 2006:2009), data_dir = "ipeds")  %>%
+    inst_info()
+# The IPEDS packages changes GENTELE from CHR to DBL between 2005 to 2006 and causes an issue.
+inst2005 = ipeds_load_series(str_c("hd", 2005), data_dir = "ipeds") %>%
+  inst_info()
+# 2004 and prior are all-caps.
+inst2004 = ipeds_load_series("hd2004", data_dir = "ipeds") %>%
+  inst_info()
+# 2002:2003 have lowercase names.
+inst2002_3 = rbind(
+  x = {ipeds_load_series(str_c("hd", 2002), data_dir = "ipeds") %>% inst_info()},
+  y = {ipeds_load_series(str_c("hd", 2003), data_dir = "ipeds") %>% inst_info()}
+  )
+
+# Merge into one.
+inst_total = bind_rows(inst_new, inst2006_9, inst2005, inst2004, inst2002_3) %>%
+  mutate(year = ymd(paste0(year,"0101")))
+# Clean.
+rm(inst_new, inst2006_9, inst2005, inst2004, inst2002_3, inst2001)
+```
+
+```{r cip_level function}
+# Universalized selection function for 2 consistent variables, cipcode and awlevel.
+cip_level = function(data){
+  data %>% 
+    clean_names() %>%  
+    # Nursing is CIP 51.3801 in 2010/2020 CIP and 51.1601 in 2000. Note that 51.1601 does not exist in the 2010/2020 CIP, so this filter is safe.
+    filter(cipcode %in% c("51.1601","51.3801"),
+           # We only need bachelor's in nursing. Note that this will include institutions that produce higher degrees.
+           awlevel == "05")}
+```
+
+```{r Degree Information}
+degs_new = ipeds_load_series(str_c("C", 2008:2023, "_A"), data_dir = "ipeds") %>%
+  cip_level() %>%
+  # ctotalt is the total variable for this block of time.
+  select(c(year, unitid, ctotalt)) %>%
+  rename("total" = "ctotalt")
+
+# Race designations change after the 2010 collection. Note that 2008:2010 include a derived column, but this fills NAs for the remaining.
+degs_old = ipeds_load_series(str_c("C", 2001:2007, "_A"), data_dir = "ipeds") %>%
+  cip_level() %>%
+  # crace24 is the total variable for this block of time.
+  select(c(year, unitid, crace24)) %>%
+  rename("total" = "crace24")
+
+# Merge.
+degs_total = rbind(degs_new, degs_old) %>%
+  mutate(year = ymd(paste0(year,"0101")))
+
+# Find St. Petersburg college.
+degs_total %>%
+  filter(unitid == 137078) %>%
+  arrange(desc(year))
+```
+```
+
