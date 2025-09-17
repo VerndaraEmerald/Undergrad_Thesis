@@ -220,5 +220,7 @@ complete_geog %>%
   filter(stabbr == "fl",
          unitid %in% fl_cc) %>%
   arrange(unit)
+
+write_csv(complete_geog, file = "inst_loc_bsn.csv")
 ```
 
