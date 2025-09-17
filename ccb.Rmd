@@ -8,66 +8,44 @@ date: "2025-06-26"
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-```{r Summon Libraries, warning=FALSE}
-# Data.
+```{r Summon Libraries, message=FALSE, warning=FALSE}
+# Data libraries.
+## Data storage.
 library(ipedsr)
-
-# Janitors.
+## Data mechanisms.
 library(tidyverse)
 library(tidytable)
+## Janitors.
 library(janitor)
 library(lubridate)
+library(fauxnaif)
+## Geography.
+library(geosphere)
 library(tidygeocoder)
-
-# Models.
-library(bacondecomp)
-library(did)
 ```
 
 # Data summoning and cleaning
-```{r Summon IPEDS Files}
+## Forming degree, institution information
+```{r Summon and Prepare IPEDS Files}
 # Need to run this only once. This downloads the IPEDS tables into a directory named "ipeds," wherever the work file is stored. These are commented out to prevent you from downloading them by mistake when pulled from Github.
 
 # ipeds_download(str_c("hd", 2002:2023), data_dir = "ipeds")
 # ipeds_download(str_c("C", 2002:2023, "_A"), data_dir = "ipeds")
-```
 
-```{r Degrees}
-# Get all paths to degree information, then read all into one list. Reads from earliest to first.
-deg_files = list.files(path = "./ipeds",
-                  pattern = "c[0-9]+_a[_rv]*.csv",
-                  full.names = T)
-# IPEDS has two different totals.
-total_var = c(total = "ctotalt", total = "crace24")
-
-deg_dflist = lapply(deg_files, function(x)
-  {tidytable::fread(x) %>%
-    clean_names() %>%
-    # Nursing is CIP 51.3801 in 2010/2020 CIP and 51.1601 in 2000. Note that 51.1601 does not exist in the 2010/2020 CIP, so this filter is safe.
-    filter(cipcode %in% c(51.1601, 51.3801),
-           # We only need bachelor's in nursing. Note that this will include institutions that produce higher degrees.
-           awlevel == 05) %>%
-    # Number of degrees per year, per institution.
-    select(any_of(c("unitid", "ctotalt", "crace24"))) %>%
-    # Standardize names.
-    rename(any_of(total_var))
-})
-
-# Add names. Note that is is in the same order as inst_files.
-names(deg_dflist) = stringi::stri_extract_all_regex(deg_files, "\\d+")
-
-deg_total = bind_rows(deg_dflist, .id = T) %>%
-  # Create year column.
-  rename("year" = .id) %>%
-  mutate(year = ymd(paste0(year,"0101")))
-```
-
-```{r Institutional Information}
 # Get all paths to institutions, then read all into one list. Reads from earliest to first.
 inst_files = list.files(path = "./ipeds",
                   pattern = "hd[0-9]+.csv",
                   full.names = T)
 
+# IPEDS has two different totals.
+total_var = c(total = "ctotalt", total = "crace24")
+# Get all paths to degree information, then read all into one list. Reads from earliest to first.
+deg_files = list.files(path = "./ipeds",
+                  pattern = "c[0-9]+_a[_rv]*.csv",
+                  full.names = T)
+```
+
+```{r Institutional Information, warning=FALSE}
 # Acquires all institutions. Note that the IALIAS column includes unusual "" at the end of some lines, but fread is able to handle these without issue.
 inst_dflist = lapply(inst_files, function(x)
   {tidytable::fread(x, encoding = "Latin-1") %>%
@@ -80,20 +58,83 @@ inst_dflist = lapply(inst_files, function(x)
 # Add names. Note that is is in the same order as inst_files.
 names(inst_dflist) = stringi::stri_extract_all_regex(inst_files, "\\d+")
 
+# Merge.
 inst_total = bind_rows(inst_dflist, .id = T) %>%
   # Create year column.
   rename("year" = .id) %>%
-  mutate(year = ymd(paste0(year,"0101")))
+  mutate(year = as.numeric(year),
+         lat = as.numeric(latitude),
+         lon = as.numeric(longitud)) %>%
+  # Discard the original location values.
+  select(-c(latitude, longitud)) %>%
+  # Replace empty quotes with NA.
+  mutate(addr = na_if_in(addr, list("", " ")))
+
+# Finds all institutions that change from a Carnegie 40/33 institution, just in case.
+changes = inst_total %>%
+  select(c(unitid, carnegie, control)) %>%
+  # Find all groups that fit part of the criteria for a CC (Carnegie 33/40).
+  group_by(unitid) %>% 
+  filter(any(carnegie == 40 | carnegie == 33)) %>%
+  # If the institution changed designation, it'll appear more than once.
+  distinct(unitid, carnegie) %>%
+  summarize(n = n(unitid)) %>%
+  arrange(desc(n)) %>%
+  filter(n >= 2) %>%
+  pull(unitid)
 ```
 
-```{r Select CCB States}
-# Join institutional information and degree information.
-total = left_join(inst_total, deg_total, by = c("year","unitid")) %>%
-  mutate(total = replace_na(total, 0))
+```{r Degrees}
+deg_dflist = lapply(deg_files, function(x)
+  {tidytable::fread(x) %>%
+    clean_names() %>%
+    # Nursing is CIP 51.3801 in 2010/2020 CIP and 51.1601 in 2000. Note that 51.1601 does not exist in the 2010/2020 CIP, so this filter is safe.
+    filter(cipcode %in% c(51.1601, 51.3801),
+           # We only need any production of bachelor's in nursing.
+           awlevel == 05) %>%
+    # Number of degrees per year, per institution.
+    select(any_of(c("unitid", "ctotalt", "crace24"))) %>%
+    # Standardize names.
+    rename(any_of(total_var)) %>%
+    # Summarizes first/second major.
+    group_by(unitid) %>%
+    summarize(total = sum(total))
+})
 
-# Detect states that have CCB programs at all.
-program = total %>%
-  # The Carnegie classification indicates that an institution is an associate's or bacc/associate's college, i.e. of our interest.
+# Add names. Note that is is in the same order as inst_files.
+names(deg_dflist) = stringi::stri_extract_all_regex(deg_files, "\\d+")
+
+# Merge.
+deg_total = bind_rows(deg_dflist, .id = T) %>%
+  # Create year column.
+  rename("year" = .id) %>%
+  mutate(year = as.numeric(year)) %>%
+  # Some institutes have no BSN output recorded early on, so we need placeholder years.
+  group_by(unitid) %>%
+  complete(year = 2002:2023)
+
+# Find and discard campuses that never produce a BSN over our timeframe.
+no_bsn = deg_total %>% 
+  group_by(unitid) %>%
+  summarize(bsns = sum(total)) %>%
+  filter(bsns == 0) %>%
+  # Access as vector.
+  pull(unitid)
+deg_total = deg_total %>%
+  filter(!unitid %in% no_bsn)
+```
+
+```{r Join}
+# Join institutional information and degree information.
+total = right_join(inst_total, deg_total, by = c("year","unitid")) %>%
+  mutate(total = replace_na(total, 0))
+```
+
+## Geographic Filtering
+```{r Select CCB States}
+# Detect states that have a CCB program at all.
+program_exist = total %>%
+  # This Carnegie classification indicates that an institution is an associate's or bacc/associate's college, i.e. of our interest.
   filter(carnegie == 40 | carnegie == 33,
          # Public control.
          control == 1) %>%
@@ -105,44 +146,79 @@ program = total %>%
   # Access as vector.
   pull(stabbr)
 
-# Total with only CCB programs.
-total = total %>%
-  filter(stabbr %in% no_program,
-         # Keeps only BSN-producing institutions and public CCs.
-         total != 0 | carnegie == 40)
-```
-
-```{r Geocoding}
-# Abbreviate generic locations and remove periods.
+# Abbreviate some generic locations.
 loc_long = c("street", "road", "avenue", "drive", "boulevard", "parkway", "suite", "suites", "expressway")
 loc_abb = c("st","rd","ave","dr","blvd", "pky", "ste,", "ste", "expy")
 
-# Acquire unique geographies for all institutions across the years.
-unique_geo = total %>%
-  # Identify geography-year-institution.
-  group_by(unitid) %>%
-  select(c(year, unitid, instnm, addr, city, stabbr, longitud, latitude)) %>%
-  arrange(unitid, year) %>%
+# Total. This only has states with CCB programs.
+total_ccb = total %>%
+  filter(stabbr %in% program_exist,
+         # Keeps only BSN-producing institutions and public CCs.
+         total != 0 | carnegie == 40) %>%
+  # We assume the institution did not move if the address is empty.
+  group_by(unitid) %>% arrange(unitid, year) %>%
+  fill(addr, .direction = "updown") %>%
+  ungroup() %>%
   # Clean addresses. Note that some addresses, e.g. accented characters, need to be unescaped.
-  mutate(addr = tolower(addr) %>%
-           # Abbreviate some generic locations.
-           stringi::stri_replace_all_regex(.,
+  mutate(addr = stringi::stri_replace_all_regex(addr,
                                            pattern = loc_long,
                                            replacement = loc_abb,
                                            vectorize = F)) %>%
-  # Find all unique addresses.
-  distinct(addr, .keep_all = T)
-
-# Florida.
-fl_geog = unique_geo %>%
-  filter(stabbr == "fl" & is.na(latitude)) %>%
-  geocode(street = addr, city = city, state = stabbr, method = "arcgis") %>%
-  select(c(year, unitid, lat, long))
+  # Fill upwards when addresses perfectly match.
+  group_by(addr) %>%
+  fill(lat, lon, .direction = "up")
 ```
 
-```{r}
-usethis::use_github(
-  "https://github.com/VerndaraEmerald/Undergrad_Thesis.git"
-)
+```{r Unique Addresses}
+# Acquire unique geographies for all germane institutions across the years. If an institution appears more than once, this indicates it either moved or its address changed slightly.
+unique_geo = total_ccb %>%
+  # Identify geography-year-institution.
+  group_by(unitid) %>%
+  select(c(year, unitid, instnm, addr, city, stabbr, lon, lat)) %>%
+  # Note: descending year keeps the more recent years. This keeps latitudes/longitudes from later years.
+  arrange(desc(year)) %>%
+  # Find all unique addresses. There do exist some addresses that do not have associated latitude/longitude values.
+  distinct(addr, .keep_all = T)
+
+# Find latitudes and longitudes for all remaining entries. Slow because of arcgis.
+incomplete_geo = unique_geo %>%
+  filter(is.na(lon)) %>%
+  # Easier merge later.
+  select(-c(lon, lat)) %>%
+  geocode_combine(
+    # Perform census, then arcgis for remaining entries.
+    queries = list(list(method = "census"), list(method = "arcgis")),
+    global_params = list(street = "addr", city = "city"), 
+    lat = "lat", long = "lon") %>%
+  select(-c(query))
+```
+
+```{r Combine}
+# Combine by year-campus, replacing in NAs.
+complete_geog = rows_patch(total_ccb, incomplete_geo, by = c("unitid", "year")) %>%
+  # Fill upwards when addresses perfectly match.
+  group_by(addr) %>%
+  fill(lat, lon, .direction = "up")
+```
+
+## Create Clusters
+```{r CC Clusters}
+# CCs are considered to be Carnegie 33 or 40 designations and public.
+fl_cc = inst_total %>%
+  filter(carnegie == 40 | carnegie == 33,
+         control == 1,
+         stabbr == "fl") %>%
+  pull(unitid) %>%
+  unique()
+
+# Find all other non-cc institutions
+fl_non_cc = complete_geog %>%
+  filter(stabbr == "fl",
+         !unitid %in% fl_cc)
+
+complete_geog %>%
+  filter(stabbr == "fl",
+         unitid %in% fl_cc) %>%
+  arrange(unit)
 ```
 
